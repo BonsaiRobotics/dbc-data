@@ -382,7 +382,7 @@ impl<'a> SignalInfo<'a> {
                 let scale = self.scale;
                 let offset = *self.signal.offset() as f32;
                 quote! {
-                    self.#name = ((#value as f32) * #scale) + #offset;
+                    self.#name = (#value as f32) * #scale + #offset;
                 }
             }
         }
@@ -414,7 +414,7 @@ impl<'a> SignalInfo<'a> {
                 let scale = self.scale;
                 let offset = self.signal.offset as f32;
                 ts.append_all(quote! {
-                    let v = ((self.#name - #offset) / #scale) as #utype;
+                    let v = (((self.#name - #offset) * (1.0 / #scale)).round()) as #utype;
                 });
             } else {
                 ts.append_all(quote! {
