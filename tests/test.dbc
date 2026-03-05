@@ -65,6 +65,34 @@ BO_ 130 GroupData3: 8 Ecu1
  SG_ ValueA : 0|32@1+ (1,0) [0|0] "" Vector__XXX
  SG_ ValueB : 32|32@1+ (1,0) [0|0] "" Vector__XXX
 
+BO_ 200 SubByteLE: 8 Ecu1
+ SG_ Nibble0 : 0|4@1+ (1,0) [0|15] "" Vector__XXX
+ SG_ Nibble1 : 4|4@1+ (1,0) [0|15] "" Vector__XXX
+ SG_ Nibble2 : 8|4@1+ (1,0) [0|15] "" Vector__XXX
+ SG_ Nibble3 : 12|4@1+ (1,0) [0|15] "" Vector__XXX
+ SG_ TwelveBit : 16|12@1+ (1,0) [0|4095] "" Vector__XXX
+ SG_ TwelveBit2 : 28|12@1+ (1,0) [0|4095] "" Vector__XXX
+ SG_ Signed4 : 40|4@1- (1,0) [0|0] "" Vector__XXX
+ SG_ Unsigned12at44 : 44|12@1+ (1,0) [0|4095] "" Vector__XXX
+ SG_ Unsigned8 : 56|8@1+ (1,0) [0|255] "" Vector__XXX
+
+BO_ 65536 VCU0Tx0: 8 VCU0
+ SG_ ctrl_mode_act : 0|4@1+ (1,0) [0|15] "MODE" Vector__XXX
+ SG_ ctrl_counter : 4|4@1+ (1,0) [0|15] "CNT" Vector__XXX
+ SG_ drive_state_act : 8|4@1+ (1,0) [0|15] "STATE" Vector__XXX
+ SG_ drive_mode_act : 12|4@1+ (1,0) [0|15] "MODE" Vector__XXX
+ SG_ vcu_ctrl_options1 : 16|8@1+ (1,0) [0|255] "OPT1" Vector__XXX
+ SG_ vcu_ctrl_options2 : 24|8@1+ (1,0) [0|255] "OPT2" Vector__XXX
+ SG_ steer_value : 32|16@1- (1,0) [-32768|32767] "CM" Vector__XXX
+ SG_ velocity_mms : 48|16@1- (1,0) [-32768|32767] "MM/S" Vector__XXX
+
+BO_ 66816 VCU0Tx5: 8 VCU0
+ SG_ features : 0|8@1+ (1,0) [0|255] "FEAT" Vector__XXX
+ SG_ wheel_dia_mm : 8|12@1+ (1,0) [0|4095] "MM" Vector__XXX
+ SG_ gear_ratio : 20|12@1+ (1,0) [0|4095] "RATIO" Vector__XXX
+ SG_ wheel_base_mm : 32|16@1+ (1,0) [0|65535] "MM" Vector__XXX
+ SG_ wheel_track_mm : 48|16@1+ (1,0) [0|65535] "MM" Vector__XXX
+
 BA_DEF_DEF_  "GenMsgSendType" "";
 BA_DEF_DEF_  "GenMsgDelayTime" 0;
 BA_DEF_DEF_  "GenMsgCycleTime" 0;
