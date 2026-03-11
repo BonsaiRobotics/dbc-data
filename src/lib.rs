@@ -79,7 +79,7 @@
 //! * Generate dispatcher for decoding based on ID (including ranges)
 //! * Enforce that arrays of messages contain the same signals
 //! * Support multiplexed signals
-//! * Emit `enum`s for value-tables, with optional type association
+//! * Emit `enum`s for value-tables, with optional type association (basic VAL_TABLE_ support done)
 //! * (Maybe) scope generated types to a module
 //!
 //! # License
@@ -564,6 +564,21 @@ impl<'a> DeriveData<'a> {
     fn build(self) -> TokenStream {
         let mut out = TokenStream::new();
 
+        // Generate enums from VAL_TABLE_ definitions
+        let mut generated_enums = std::collections::HashSet::new();
+        for vt in self.dbc.value_tables().iter() {
+            let table_name = vt.value_table_name();
+            if table_name.is_empty()
+                || vt.value_descriptions().is_empty()
+            {
+                continue;
+            }
+            if !generated_enums.insert(table_name.clone()) {
+                continue; // skip duplicates
+            }
+            out.append_all(Self::gen_enum(table_name, vt.value_descriptions()));
+        }
+
         for (name, message) in self.messages.iter() {
             let m = self
                 .dbc
@@ -647,6 +662,89 @@ impl<'a> DeriveData<'a> {
             });
         }
         out
+    }
+
+    /// Generate a Rust enum from a DBC VAL_TABLE_ definition.
+    ///
+    /// Produces:
+    /// - `#[repr(u8)]` enum with `Debug, Clone, Copy, PartialEq, Eq`
+    /// - `TryFrom<u8>` impl
+    /// - `From<Enum> for u8` impl
+    /// - `Default` impl (variant with value 0, or lowest value)
+    fn gen_enum(
+        name: &str,
+        descriptions: &[can_dbc::ValDescription],
+    ) -> TokenStream {
+        // Sort by numeric value for deterministic output
+        let mut entries: Vec<(u8, String)> = descriptions
+            .iter()
+            .map(|vd| (*vd.a() as u8, vd.b().clone()))
+            .collect();
+        entries.sort_by_key(|(v, _)| *v);
+
+        if entries.is_empty() {
+            return TokenStream::new();
+        }
+
+        let enum_ident = Ident::new(name, proc_macro2::Span::call_site());
+
+        let variant_idents: Vec<Ident> = entries
+            .iter()
+            .map(|(_, desc)| {
+                Ident::new(desc, proc_macro2::Span::call_site())
+            })
+            .collect();
+        let variant_values: Vec<u8> =
+            entries.iter().map(|(v, _)| *v).collect();
+
+        // Default to variant with value 0 if it exists, otherwise
+        // the first (lowest-valued) variant
+        let default_ident = entries
+            .iter()
+            .find(|(v, _)| *v == 0)
+            .map(|(_, desc)| desc.as_str())
+            .unwrap_or(&entries[0].1);
+        let default_ident =
+            Ident::new(default_ident, proc_macro2::Span::call_site());
+
+        let error_msg = format!("Invalid {} value", name);
+
+        quote! {
+            #[repr(u8)]
+            #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+            #[allow(dead_code)]
+            #[allow(non_camel_case_types)]
+            pub enum #enum_ident {
+                #(
+                    #variant_idents = #variant_values
+                ),*
+            }
+
+            impl core::convert::TryFrom<u8> for #enum_ident {
+                type Error = &'static str;
+
+                fn try_from(value: u8) -> Result<Self, Self::Error> {
+                    match value {
+                        #(
+                            #variant_values => Ok(Self::#variant_idents),
+                        )*
+                        _ => Err(#error_msg),
+                    }
+                }
+            }
+
+            impl From<#enum_ident> for u8 {
+                fn from(value: #enum_ident) -> u8 {
+                    value as u8
+                }
+            }
+
+            impl Default for #enum_ident {
+                fn default() -> Self {
+                    Self::#default_ident
+                }
+            }
+        }
     }
 }
 
