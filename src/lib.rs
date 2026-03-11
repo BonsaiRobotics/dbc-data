@@ -532,6 +532,13 @@ impl<'a> DeriveData<'a> {
             }
         };
 
+        // Collect VAL_TABLE_ names so we can accept them as fields
+        let val_table_names: std::collections::HashSet<String> = dbc
+            .value_tables()
+            .iter()
+            .map(|vt| vt.value_table_name().clone())
+            .collect();
+
         // gather all of the messages and associated attributes
         let mut messages: BTreeMap<String, MessageInfo<'_>> =
             Default::default();
@@ -541,6 +548,11 @@ impl<'a> DeriveData<'a> {
                     for field in &fields.named {
                         if let Some(info) = MessageInfo::new(&dbc, field) {
                             messages.insert(info.ident.to_string(), info);
+                        } else if Self::field_type_name(field)
+                            .map_or(false, |n| val_table_names.contains(&n))
+                        {
+                            // Field type matches a VAL_TABLE_ enum;
+                            // skip it (the enum is generated separately)
                         } else {
                             return Err(syn::Error::new(
                                 field.span(),
@@ -561,6 +573,14 @@ impl<'a> DeriveData<'a> {
         })
     }
 
+    /// Extract the type name from a struct field (e.g. `foo: MyType` → "MyType")
+    fn field_type_name(field: &Field) -> Option<String> {
+        match &field.ty {
+            Type::Path(v) => Some(v.path.segments[0].ident.to_string()),
+            _ => None,
+        }
+    }
+
     fn build(self) -> TokenStream {
         let mut out = TokenStream::new();
 
@@ -568,9 +588,7 @@ impl<'a> DeriveData<'a> {
         let mut generated_enums = std::collections::HashSet::new();
         for vt in self.dbc.value_tables().iter() {
             let table_name = vt.value_table_name();
-            if table_name.is_empty()
-                || vt.value_descriptions().is_empty()
-            {
+            if table_name.is_empty() || vt.value_descriptions().is_empty() {
                 continue;
             }
             if !generated_enums.insert(table_name.clone()) {
@@ -690,12 +708,9 @@ impl<'a> DeriveData<'a> {
 
         let variant_idents: Vec<Ident> = entries
             .iter()
-            .map(|(_, desc)| {
-                Ident::new(desc, proc_macro2::Span::call_site())
-            })
+            .map(|(_, desc)| Ident::new(desc, proc_macro2::Span::call_site()))
             .collect();
-        let variant_values: Vec<u8> =
-            entries.iter().map(|(v, _)| *v).collect();
+        let variant_values: Vec<u8> = entries.iter().map(|(v, _)| *v).collect();
 
         // Default to variant with value 0 if it exists, otherwise
         // the first (lowest-valued) variant
