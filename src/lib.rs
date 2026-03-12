@@ -73,10 +73,9 @@
 //! * Decode signals from PDU into native types
 //!     * const definitions for `ID: u32`, `DLC: u8`, `EXTENDED: bool`,
 //!       and `CYCLE_TIME: usize` when present
-//! * Encode signal into PDU (except unaligned BE)
+//! * Encode signals into PDU (all alignments and byte orders)
 //!
 //! # TODO
-//! * Encode unaligned BE signals
 //! * Generate dispatcher for decoding based on ID (including ranges)
 //! * Enforce that arrays of messages contain the same signals
 //! * Support multiplexed signals
@@ -89,14 +88,14 @@
 
 extern crate proc_macro;
 use can_dbc::{
-    AttributeValuedForObjectType, ByteOrder, MessageId, Signal, ValueType, DBC,
+    AttributeValuedForObjectType, ByteOrder, DBC, MessageId, Signal, ValueType,
 };
 use proc_macro2::TokenStream;
-use quote::{quote, TokenStreamExt};
+use quote::{TokenStreamExt, quote};
 use std::{collections::BTreeMap, fs::read};
 use syn::{
-    parse_macro_input, spanned::Spanned, Attribute, Data, DeriveInput, Expr,
-    Field, Fields, Ident, Lit, Meta, Result, Type,
+    Attribute, Data, DeriveInput, Expr, Field, Fields, Ident, Lit, Meta,
+    Result, Type, parse_macro_input, spanned::Spanned,
 };
 
 struct DeriveData<'a> {
@@ -200,165 +199,94 @@ impl<'a> SignalInfo<'a> {
         }
     }
 
-    /// Generate the code for extracting signal bits
+    /// Generate the code for extracting signal bits using an
+    /// accumulator pattern that handles all alignment cases uniformly.
     fn extract_bits(&self) -> TokenStream {
-        let low = self.start / 8;
-        let left = self.start % 8;
-        let high = (self.start + self.width - 1) / 8;
-        let right = (self.start + self.width) % 8;
         let utype = &self.utype;
         let le = self.signal.byte_order() == &ByteOrder::LittleEndian;
+        let width = self.width;
 
         let mut ts = TokenStream::new();
-        if self.width == self.nwidth && left == 0 {
-            // aligned
-            let ext = if le {
-                Ident::new("from_le_bytes", utype.span())
+
+        if le {
+            let start_byte = self.start / 8;
+            let s_off = self.start % 8;
+            let end_bit = self.start + width - 1;
+            let end_byte = end_bit / 8;
+            let e_off = end_bit % 8;
+
+            // Accumulate masked bytes into u64
+            ts.append_all(quote! { let mut acc: u64 = 0; });
+            for b in start_byte..=end_byte {
+                let idx = b - start_byte;
+                if start_byte == end_byte {
+                    // single byte: mask both ends
+                    let mask = ((0xFFu16 << s_off as u16)
+                        & (0xFFu16 >> (7 - e_off as u16)))
+                        as u8;
+                    ts.append_all(quote! {
+                        acc |= ((pdu[#b] & #mask) as u64) << (8 * #idx);
+                    });
+                } else if b == start_byte {
+                    let mask = (0xFFu16 << s_off as u16) as u8;
+                    ts.append_all(quote! {
+                        acc |= ((pdu[#b] & #mask) as u64) << (8 * #idx);
+                    });
+                } else if b == end_byte {
+                    let mask = (0xFFu16 >> (7 - e_off as u16)) as u8;
+                    ts.append_all(quote! {
+                        acc |= ((pdu[#b] & #mask) as u64) << (8 * #idx);
+                    });
+                } else {
+                    ts.append_all(quote! {
+                        acc |= (pdu[#b] as u64) << (8 * #idx);
+                    });
+                }
+            }
+            // Shift and mask to extract the value
+            let mask_expr = if width == 64 {
+                quote! { u64::MAX }
             } else {
-                Ident::new("from_be_bytes", utype.span())
+                quote! { ((1u64 << #width) - 1) }
             };
-            let tokens = match self.width {
-                8 => quote! {
-                    #utype::#ext([pdu[#low]])
-                },
-                16 => quote! {
-                    #utype::#ext([pdu[#low],
-                                  pdu[#low + 1]])
-                },
-                32 => quote! {
-                    #utype::#ext([pdu[#low + 0],
-                                  pdu[#low + 1],
-                                  pdu[#low + 2],
-                                  pdu[#low + 3]])
-                },
-                // NOTE: this compiles to very small code and does not
-                // involve actually fetching 8 separate bytes; e.g. on
-                // armv7 an `ldrd` to get both 32-bit values followed by
-                // two `rev` instructions to reverse the bytes.
-                64 => quote! {
-                    #utype::#ext([pdu[#low + 0],
-                                  pdu[#low + 1],
-                                  pdu[#low + 2],
-                                  pdu[#low + 3],
-                                  pdu[#low + 4],
-                                  pdu[#low + 5],
-                                  pdu[#low + 6],
-                                  pdu[#low + 7],
-                    ])
-                },
-                _ => unimplemented!(),
-            };
-            ts.append_all(tokens);
+            ts.append_all(quote! {
+                let v = ((acc >> #s_off) & #mask_expr) as #utype;
+            });
         } else {
-            if le {
-                let count = high - low;
-                for o in 0..=count {
-                    let byte = low + o;
-                    if o == 0 {
-                        // first byte
-                        ts.append_all(quote! {
-                            let v = pdu[#byte] as #utype;
-                        });
-                        if left != 0 {
-                            if count == 0 {
-                                ts.append_all(quote! {
-                                    let v = (v >> #left) & ((1 << #left) - 1);
-                                });
-                            } else {
-                                ts.append_all(quote! {
-                                    let v = v >> #left;
-                                });
-                            }
-                        }
-                    } else {
-                        let shift = (o * 8) - left;
-                        if o == count && right != 0 {
-                            ts.append_all(quote! {
-                                let v = v | (((pdu[#byte]
-                                               & ((1 << #right) - 1))
-                                              as #utype) << #shift);
-                            });
-                        } else {
-                            ts.append_all(quote! {
-                                let v = v | ((pdu[#byte] as #utype) << #shift);
-                            });
-                        }
+            // Big-endian (Motorola): per-bit gather, MSB first.
+            // In DBC format, start_bit for BE is the Motorola bit
+            // position of the MSB: byte = sb/8, bit_in_byte = sb%8.
+            // Walk: bit-1, wrapping from 0 to 7 of the next byte.
+            let sb = self.start;
+            ts.append_all(quote! {
+                let mut raw: u64 = 0;
+                {
+                    let mut byte = (#sb / 8) as usize;
+                    let mut bit = (#sb % 8) as i32;
+                    let mut i = 0usize;
+                    while i < #width {
+                        let b = ((pdu[byte] >> (bit as u8)) & 1) as u64;
+                        raw |= b << (#width - 1 - i);
+                        bit -= 1;
+                        if bit < 0 { bit = 7; byte += 1; }
+                        i += 1;
                     }
                 }
-            } else {
-                // big-endian
-                let mut rem = self.width;
-                let mut byte = low;
-                while rem > 0 {
-                    if byte == low {
-                        // first byte
-                        ts.append_all(quote! {
-                            let v = pdu[#byte] as #utype;
-                        });
-                        if rem < 8 {
-                            // single byte
-                            let mask = rem - 1;
-                            let shift = left + 1 - rem;
-                            ts.append_all(quote! {
-                                let mask: #utype = (1 << #mask)
-                                    | ((1 << #mask) - 1);
-                                let v = (v >> #shift) & mask;
-                            });
-                            rem = 0;
-                        } else {
-                            // first of multiple bytes
-                            let mask = left;
-                            let shift = rem - left - 1;
-                            if mask < 7 {
-                                ts.append_all(quote! {
-                                    let mask: #utype = (1 << #mask)
-                                        | ((1 << #mask) - 1);
-                                    let v = (v & mask) << #shift;
-                                });
-                            } else {
-                                ts.append_all(quote! {
-                                    let v = v << #shift;
-                                });
-                            }
-                            rem -= left + 1;
-                        }
-                        byte += 1;
-                    } else {
-                        if rem < 8 {
-                            // last byte: take top bits
-                            let shift = 8 - rem;
-                            ts.append_all(quote! {
-                                let v = v |
-                                ((pdu[#byte] as #utype) >> #shift);
-                            });
-                            rem = 0;
-                        } else {
-                            rem -= 8;
-                            ts.append_all(quote! {
-                                let v = v |
-                                ((pdu[#byte] as #utype) << #rem);
-                            });
-                            byte += 1;
-                        }
-                    };
-                }
-            }
-            // perform sign-extension for values with fewer bits than
-            // the storage type
-            if self.signed && self.width < self.nwidth {
-                let mask = self.width - 1;
-                ts.append_all(quote! {
-                    let mask: #utype = (1 << #mask);
-                    let v = if (v & mask) != 0 {
-                        let mask = mask | (mask - 1);
-                        v | !mask
-                    } else {
-                        v
-                    };
-                });
-            }
-            ts.append_all(quote! { v });
+            });
+            ts.append_all(quote! {
+                let v = raw as #utype;
+            });
         }
+
+        // Sign-extend for signed values with fewer bits than storage
+        if self.signed && self.width < self.nwidth {
+            let width = self.width;
+            ts.append_all(quote! {
+                let v = (((v as i64) << (64 - #width)) >> (64 - #width)) as #utype;
+            });
+        }
+
+        ts.append_all(quote! { v });
         quote! { { #ts } }
     }
 
@@ -390,113 +318,130 @@ impl<'a> SignalInfo<'a> {
 
     fn gen_encoder(&self) -> TokenStream {
         let name = &self.ident;
-        let low = self.start / 8;
-        let mut byte = low;
         let bit = self.start % 8;
-        if self.width == 1 {
+        let width = self.width;
+
+        if width == 1 {
             // boolean
-            quote! {
+            let byte = self.start / 8;
+            return quote! {
                 let mask: u8 = (1 << #bit);
                 if self.#name {
                     pdu[#byte] |= mask;
                 } else {
                     pdu[#byte] &= !mask;
                 }
+            };
+        }
+
+        let utype = &self.utype;
+        let le = self.signal.byte_order() == &ByteOrder::LittleEndian;
+
+        let mut ts = TokenStream::new();
+        if self.is_float() {
+            let scale = self.scale;
+            let offset = self.signal.offset as f32;
+            ts.append_all(quote! {
+                let v = (((self.#name - #offset) * (1.0 / #scale)).round()) as #utype;
+            });
+        } else {
+            ts.append_all(quote! {
+                let v = self.#name;
+            });
+        }
+
+        if le {
+            let start_byte = self.start / 8;
+            let s_off = self.start % 8;
+            let end_bit = self.start + width - 1;
+            let end_byte = end_bit / 8;
+            let e_off = end_bit % 8;
+
+            // Mask value to signal width and shift into position
+            let mask_expr = if width == 64 {
+                quote! { u64::MAX }
+            } else {
+                quote! { ((1u64 << #width) - 1) }
+            };
+            if self.signed {
+                ts.append_all(quote! {
+                    let mut val: u64 = (((v as i64) as i128 & ((1i128 << #width) - 1)) as u64);
+                });
+            } else {
+                ts.append_all(quote! {
+                    let mut val: u64 = (v as u64) & #mask_expr;
+                });
+            }
+            ts.append_all(quote! {
+                val <<= #s_off;
+            });
+
+            // Write each byte with proper masking
+            for b in start_byte..=end_byte {
+                let idx = b - start_byte;
+                if start_byte == end_byte {
+                    let mask = ((0xFFu16 << s_off as u16)
+                        & (0xFFu16 >> (7 - e_off as u16)))
+                        as u8;
+                    ts.append_all(quote! {
+                        pdu[#b] = (pdu[#b] & !#mask)
+                            | ((((val >> (8 * #idx)) & 0xFF) as u8) & #mask);
+                    });
+                } else if b == start_byte {
+                    let mask = (0xFFu16 << s_off as u16) as u8;
+                    ts.append_all(quote! {
+                        pdu[#b] = (pdu[#b] & !#mask)
+                            | (((val >> (8 * #idx)) & 0xFF) as u8 & #mask);
+                    });
+                } else if b == end_byte {
+                    let mask = (0xFFu16 >> (7 - e_off as u16)) as u8;
+                    ts.append_all(quote! {
+                        pdu[#b] = (pdu[#b] & !#mask)
+                            | (((val >> (8 * #idx)) & 0xFF) as u8 & #mask);
+                    });
+                } else {
+                    ts.append_all(quote! {
+                        pdu[#b] = ((val >> (8 * #idx)) & 0xFF) as u8;
+                    });
+                }
             }
         } else {
-            let utype = &self.utype;
-            let left = self.start % 8;
-            // let right = (self.start + self.width) % 8;
-            let le = self.signal.byte_order() == &ByteOrder::LittleEndian;
-
-            let mut ts = TokenStream::new();
-            if self.is_float() {
-                let scale = self.scale;
-                let offset = self.signal.offset as f32;
+            // Big-endian (Motorola): per-bit scatter, MSB first.
+            let sb = self.start;
+            let mask_expr = if width == 64 {
+                quote! { u64::MAX }
+            } else {
+                quote! { ((1u64 << #width) - 1) }
+            };
+            if self.signed {
                 ts.append_all(quote! {
-                    let v = (((self.#name - #offset) * (1.0 / #scale)).round()) as #utype;
+                    let val: u64 = (((v as i64) as i128 & ((1i128 << #width) - 1)) as u64);
                 });
             } else {
                 ts.append_all(quote! {
-                    let v = self.#name;
+                    let val: u64 = (v as u64) & #mask_expr;
                 });
             }
-            if le {
-                if self.width == self.nwidth && left == 0 {
-                    // aligned little-endian
-                    let mut bits = self.nwidth;
-                    let mut shift = 0;
-                    while bits >= 8 {
-                        ts.append_all(quote! {
-                            pdu[#byte] = ((v >> #shift) as u8) & 0xff;
-                        });
-                        bits -= 8;
-                        byte += 1;
-                        shift += 8;
-                    }
-                } else {
-                    // unaligned little-endian
-                    let mut rem = self.width;
-                    let mut lshift = left;
-                    let mut rshift = 0;
-                    while rem > 0 {
-                        if rem < 8 {
-                            let mask: u8 = (1 << rem) - 1;
-                            let mask = mask << lshift;
-                            ts.append_all(quote! {
-                                pdu[#byte] = (pdu[#byte] & !#mask) |
-                                ((((v >> #rshift) << (#lshift)) as u8) & #mask);
-                            });
-                            break;
-                        }
-
-                        if lshift != 0 {
-                            let mask: u8 = (1 << (8 - left)) - 1;
-                            let mask = mask << lshift;
-                            ts.append_all(quote! {
-                                pdu[#byte] = (pdu[#byte] & !#mask) |
-                                ((((v >> #rshift) << (#lshift)) as u8) & #mask);
-                            });
+            ts.append_all(quote! {
+                {
+                    let mut byte = (#sb / 8) as usize;
+                    let mut bit = (#sb % 8) as i32;
+                    let mut i = 0usize;
+                    while i < #width {
+                        let src = ((val >> (#width - 1 - i)) & 1) as u8;
+                        if src == 1 {
+                            pdu[byte] |= 1u8 << (bit as u8);
                         } else {
-                            ts.append_all(quote! {
-                                pdu[#byte] = ((v >> #rshift) & 0xff) as u8;
-                            });
+                            pdu[byte] &= !(1u8 << (bit as u8));
                         }
-
-                        if byte == low {
-                            rem -= 8 - left;
-                            rshift += 8 - left;
-                        } else {
-                            rem -= 8;
-                            rshift += 8;
-                        }
-                        byte += 1;
-                        lshift = 0;
+                        bit -= 1;
+                        if bit < 0 { bit = 7; byte += 1; }
+                        i += 1;
                     }
                 }
-            } else {
-                if self.width == self.nwidth && left == 7 {
-                    // aligned big-endian
-                    let mut bits = self.nwidth;
-                    let mut shift = bits - 8;
-                    let mut byte = (self.start - 7) / 8;
-                    while bits >= 8 {
-                        ts.append_all(quote! {
-                            pdu[#byte] = ((v >> #shift) as u8) & 0xff;
-                        });
-                        bits -= 8;
-                        byte += 1;
-                        if shift >= 8 {
-                            shift -= 8;
-                        }
-                    }
-                } else {
-                    // unaligned big-endian
-                    //                    todo!();
-                }
-            }
-            ts
+            });
         }
+        ts
     }
 
     fn is_float(&self) -> bool {
@@ -676,9 +621,9 @@ impl<'a> DeriveData<'a> {
                 }
 
                 impl #ident {
-                    const ID: u32 = #id;
-                    const DLC: u8 = #dlc8;
-                    const EXTENDED: bool = #extended;
+                    pub const ID: u32 = #id;
+                    pub const DLC: u8 = #dlc8;
+                    pub const EXTENDED: bool = #extended;
                     #cycle_time
 
                     pub fn decode(&mut self, pdu: &[u8])
