@@ -33,9 +33,9 @@
 //!     assert_eq!(SomeMessage::ID, 1023);
 //!     assert_eq!(SomeMessage::DLC, 4);
 //!     assert!(t.some_message.decode(&[0xFE, 0x34, 0x56, 0x78]));
-//!     assert_eq!(t.some_message.Signed8, -2);
-//!     assert_eq!(t.some_message.Unsigned8, 0x34);
-//!     assert_eq!(t.some_message.Unsigned16, 0x5678); // big-endian
+//!     assert_eq!(t.some_message.signed8, -2);
+//!     assert_eq!(t.some_message.unsigned8, 0x34);
+//!     assert_eq!(t.some_message.unsigned16, 0x5678); // big-endian
 //! }
 //! ```
 //! See the test cases in this crate for examples of usage.
@@ -97,6 +97,109 @@ use syn::{
     Attribute, Data, DeriveInput, Expr, Field, Fields, Ident, Lit, Meta,
     Result, Type, parse_macro_input, spanned::Spanned,
 };
+
+/// Convert a string to snake_case.
+///
+/// Handles PascalCase, camelCase, SCREAMING_SNAKE_CASE, and mixtures:
+///   "VCU0Tx1TCU0" → "vcu0_tx1_tcu0"
+///   "ROBOT_COMMAND" → "robot_command"
+///   "StatusIbxFlow" → "status_ibx_flow"
+///   "already_snake" → "already_snake"
+fn to_snake_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    let mut prev_was_upper = false;
+    let mut prev_was_underscore = true; // treat start as boundary
+
+    for (i, ch) in s.chars().enumerate() {
+        if ch == '_' {
+            if !out.is_empty() && !prev_was_underscore {
+                out.push('_');
+            }
+            prev_was_upper = false;
+            prev_was_underscore = true;
+            continue;
+        }
+
+        if ch.is_uppercase() {
+            let next_is_lower = s[i + ch.len_utf8()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_lowercase());
+
+            // Insert underscore before:
+            //  - a capital that starts a new word (preceded by lowercase)
+            //  - a capital in a run of capitals followed by lowercase (e.g. "TCU0")
+            if !prev_was_underscore
+                && ((!prev_was_upper) || (prev_was_upper && next_is_lower))
+            {
+                out.push('_');
+            }
+
+            out.push(ch.to_lowercase().next().unwrap());
+            prev_was_upper = true;
+        } else {
+            out.push(ch);
+            prev_was_upper = false;
+        }
+        prev_was_underscore = false;
+    }
+    out
+}
+
+/// Normalize DBC file content to work around can-dbc parser quirks:
+/// - "BS_ :" → "BS_:" (parser requires no space before colon)
+/// - Collapse blank lines between BO_ blocks (parser may fail on them)
+/// - Normalize SG_ indentation to single space
+/// - Ensure trailing newline
+fn normalize_dbc(input: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut prev_was_empty = false;
+
+    for line in input.lines() {
+        let trimmed = line.trim();
+
+        // Fix "BS_ :" → "BS_:"
+        if trimmed.starts_with("BS_") && trimmed.contains(':') {
+            lines.push(trimmed.replace("BS_ :", "BS_:"));
+            prev_was_empty = false;
+            continue;
+        }
+
+        // Skip blank lines between message blocks to avoid parser issues
+        if trimmed.is_empty() {
+            // Only keep blank lines before BO_ sections or after header sections
+            prev_was_empty = true;
+            continue;
+        }
+
+        // Re-insert a single blank line before structural sections
+        if prev_was_empty
+            && (trimmed.starts_with("BO_")
+                || trimmed.starts_with("BU_")
+                || trimmed.starts_with("CM_")
+                || trimmed.starts_with("BA_")
+                || trimmed.starts_with("VAL_"))
+        {
+            lines.push(String::new());
+        }
+
+        // Normalize SG_ indentation to single space
+        if trimmed.starts_with("SG_") {
+            lines.push(format!(" {trimmed}"));
+        } else {
+            lines.push(trimmed.to_string());
+        }
+
+        prev_was_empty = false;
+    }
+
+    // Ensure trailing newline
+    let mut result = lines.join("\n");
+    if !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result
+}
 
 struct DeriveData<'a> {
     /// Name of the struct we are deriving for
@@ -162,8 +265,7 @@ struct SignalInfo<'a> {
 
 impl<'a> SignalInfo<'a> {
     fn new(signal: &'a Signal, message: &MessageInfo) -> Self {
-        // TODO: sanitize and/or change name format
-        let name = signal.name();
+        let name = to_snake_case(signal.name());
         let signed = matches!(signal.value_type(), ValueType::Signed);
         let width = *signal.signal_size() as usize;
         let scale = *signal.factor() as f32;
@@ -188,7 +290,7 @@ impl<'a> SignalInfo<'a> {
 
         Self {
             signal,
-            ident: Ident::new(name, message.ident.span()),
+            ident: Ident::new(&name, message.ident.span()),
             ntype: Ident::new(ntype, message.ident.span()),
             utype: Ident::new(utype, message.ident.span()),
             start: *signal.start_bit() as usize,
@@ -461,10 +563,10 @@ impl<'a> MessageInfo<'a> {
             _ => unimplemented!(),
         };
         let ident = &stype.path.segments[0].ident;
-        let name = ident.to_string();
+        let name = to_snake_case(&ident.to_string());
 
         for (index, message) in dbc.messages().iter().enumerate() {
-            if message.message_name() == &name {
+            if to_snake_case(message.message_name()) == name {
                 let id = message.message_id();
                 let (id32, extended) = match *id {
                     MessageId::Standard(id) => (id as u32, false),
@@ -518,7 +620,8 @@ impl<'a> DeriveData<'a> {
         let dbc_file = parse_attr(&input.attrs, "dbc_file")
             .expect("No DBC file specified");
         let contents = read(&dbc_file).expect("Could not read DBC");
-        let dbc = match DBC::from_slice(&contents) {
+        let contents = normalize_dbc(&String::from_utf8_lossy(&contents));
+        let dbc = match DBC::from_slice(contents.as_bytes()) {
             Ok(dbc) => dbc,
             Err(can_dbc::Error::Incomplete(dbc, _)) => {
                 // TODO: emit an actual compiler warning
@@ -610,7 +713,7 @@ impl<'a> DeriveData<'a> {
             let mut types: Vec<Ident> = vec![];
             let mut infos: Vec<SignalInfo> = vec![];
             for s in m.signals().iter() {
-                if !filter.use_signal(s.name()) {
+                if !filter.use_signal(to_snake_case(s.name())) {
                     continue;
                 }
 
