@@ -174,9 +174,19 @@ fn normalize_dbc(input: &str) -> String {
             continue;
         }
 
-        // Normalize SG_ indentation to single space
+        // Normalize SG_ indentation and ensure space before colon
         if trimmed.starts_with("SG_") {
-            lines.push(format!(" {trimmed}"));
+            // "SG_ NAME:" → "SG_ NAME :" (parser needs space before colon)
+            let fixed = if let Some(pos) = trimmed.find(':') {
+                if pos > 0 && trimmed.as_bytes()[pos - 1] != b' ' {
+                    format!("{} :{}", &trimmed[..pos], &trimmed[pos + 1..])
+                } else {
+                    trimmed.to_string()
+                }
+            } else {
+                trimmed.to_string()
+            };
+            lines.push(format!(" {fixed}"));
         } else {
             lines.push(line.to_string());
         }
