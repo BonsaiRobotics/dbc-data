@@ -148,49 +148,38 @@ fn to_snake_case(s: &str) -> String {
 
 /// Normalize DBC file content to work around can-dbc parser quirks:
 /// - "BS_ :" → "BS_:" (parser requires no space before colon)
-/// - Collapse blank lines between BO_ blocks (parser may fail on them)
+/// - Remove blank lines between BO_/SG_ blocks (parser chokes on them)
 /// - Normalize SG_ indentation to single space
 /// - Ensure trailing newline
 fn normalize_dbc(input: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
-    let mut prev_was_empty = false;
+    let mut in_messages = false;
 
     for line in input.lines() {
         let trimmed = line.trim();
 
         // Fix "BS_ :" → "BS_:"
         if trimmed.starts_with("BS_") && trimmed.contains(':') {
-            lines.push(trimmed.replace("BS_ :", "BS_:"));
-            prev_was_empty = false;
+            lines.push(line.replace("BS_ :", "BS_:"));
             continue;
         }
 
-        // Skip blank lines between message blocks to avoid parser issues
-        if trimmed.is_empty() {
-            // Only keep blank lines before BO_ sections or after header sections
-            prev_was_empty = true;
-            continue;
+        // Track whether we're in the message definition section
+        if trimmed.starts_with("BO_") {
+            in_messages = true;
         }
 
-        // Re-insert a single blank line before structural sections
-        if prev_was_empty
-            && (trimmed.starts_with("BO_")
-                || trimmed.starts_with("BU_")
-                || trimmed.starts_with("CM_")
-                || trimmed.starts_with("BA_")
-                || trimmed.starts_with("VAL_"))
-        {
-            lines.push(String::new());
+        // Skip blank lines only within the message section
+        if trimmed.is_empty() && in_messages {
+            continue;
         }
 
         // Normalize SG_ indentation to single space
         if trimmed.starts_with("SG_") {
             lines.push(format!(" {trimmed}"));
         } else {
-            lines.push(trimmed.to_string());
+            lines.push(line.to_string());
         }
-
-        prev_was_empty = false;
     }
 
     // Ensure trailing newline
