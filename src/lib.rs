@@ -54,6 +54,19 @@
 //! (e.g. `SomeMessage` as shown above) and this determines what code
 //! is generated.  Messages not referenced will not generate any code.
 //!
+//! To generate *every* message and value table in a file instead, use
+//! [`dbc_all!`].  There is no struct to write:
+//!
+//! ```ignore
+//! mod flex {
+//!     dbc_data::dbc_all!("dbcs/amiga_flex.dbc");
+//! }
+//! ```
+//!
+//! Use it when the DBC already is the list of messages you care about.
+//! Use the derive when you want a minimal footprint, or need
+//! `#[dbc_signals]` to narrow a message to a few signals.
+//!
 //! When a range of message IDs contain the same signals, such as a
 //! series of readings which do not fit into a single message, then
 //! declaring an array will allow that type to be used for all of them.
@@ -201,9 +214,10 @@ fn normalize_dbc(input: &str) -> String {
 }
 
 struct DeriveData<'a> {
-    /// Name of the struct we are deriving for
+    /// Name of the struct we are deriving for. `None` when there is no
+    /// struct, i.e. the `dbc_all!` path.
     #[allow(dead_code)]
-    name: &'a Ident,
+    name: Option<&'a Ident>,
     /// The parsed DBC file
     dbc: can_dbc::DBC,
     /// All of the messages to derive
@@ -214,8 +228,10 @@ struct MessageInfo<'a> {
     id: u32,
     extended: bool,
     index: usize,
-    ident: &'a Ident,
-    attrs: &'a Vec<Attribute>,
+    ident: Ident,
+    /// `#[dbc_signals]` and friends, from the struct field this message was
+    /// named by. Empty when nothing named it — see [`DeriveData::all`].
+    attrs: &'a [Attribute],
     cycle_time: Option<usize>,
 }
 
@@ -551,6 +567,45 @@ impl<'a> SignalInfo<'a> {
 }
 
 impl<'a> MessageInfo<'a> {
+    /// Build the info for `dbc.messages()[index]`, naming the generated
+    /// type `ident`.
+    fn at_index(
+        dbc: &DBC,
+        index: usize,
+        ident: Ident,
+        attrs: &'a [Attribute],
+    ) -> Option<Self> {
+        let message = dbc.messages().get(index)?;
+        let id = message.message_id();
+        let (id32, extended) = match *id {
+            MessageId::Standard(id) => (id as u32, false),
+            MessageId::Extended(id) => (id, true),
+        };
+        Some(Self {
+            id: id32,
+            extended,
+            index,
+            ident,
+            attrs,
+            cycle_time: Self::cycle_time(dbc, id),
+        })
+    }
+
+    /// The `GenMsgCycleTime` attribute for one message, if it has one.
+    fn cycle_time(dbc: &DBC, id: &MessageId) -> Option<usize> {
+        for attr in dbc.attribute_values().iter() {
+            use AttributeValuedForObjectType as AV;
+            if let AV::MessageDefinitionAttributeValue(aid, Some(av)) =
+                attr.attribute_value()
+                && aid == id
+                && attr.attribute_name() == "GenMsgCycleTime"
+            {
+                return Some(Self::attr_value(av));
+            }
+        }
+        None
+    }
+
     fn new(dbc: &DBC, field: &'a Field) -> Option<Self> {
         let stype = match &field.ty {
             Type::Path(v) => v,
@@ -566,35 +621,7 @@ impl<'a> MessageInfo<'a> {
 
         for (index, message) in dbc.messages().iter().enumerate() {
             if to_snake_case(message.message_name()) == name {
-                let id = message.message_id();
-                let (id32, extended) = match *id {
-                    MessageId::Standard(id) => (id as u32, false),
-                    MessageId::Extended(id) => (id, true),
-                };
-                let mut cycle_time: Option<usize> = None;
-                for attr in dbc.attribute_values().iter() {
-                    let value = attr.attribute_value();
-                    use AttributeValuedForObjectType as AV;
-                    match value {
-                        AV::MessageDefinitionAttributeValue(aid, Some(av)) => {
-                            if aid == id
-                                && attr.attribute_name() == "GenMsgCycleTime"
-                            {
-                                cycle_time = Some(Self::attr_value(av));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-
-                return Some(Self {
-                    id: id32,
-                    extended,
-                    index,
-                    ident,
-                    cycle_time,
-                    attrs: &field.attrs,
-                });
+                return Self::at_index(dbc, index, ident.clone(), &field.attrs);
             }
         }
         None
@@ -613,26 +640,73 @@ impl<'a> MessageInfo<'a> {
     }
 }
 
+/// Read and parse a DBC file, applying the normalizations this crate needs.
+fn load_dbc(dbc_file: &str) -> DBC {
+    let contents = read(dbc_file).expect("Could not read DBC");
+    let contents = normalize_dbc(&String::from_utf8_lossy(&contents));
+    match DBC::from_slice(contents.as_bytes()) {
+        Ok(dbc) => dbc,
+        Err(can_dbc::Error::Incomplete(dbc, _)) => {
+            // TODO: emit an actual compiler warning
+            eprintln!("Warning: DBC load incomplete; some data may be missing");
+            dbc
+        }
+        Err(_) => {
+            panic!("Unable to parse {dbc_file}");
+        }
+    }
+}
+
+/// A DBC message name as a Rust type name.
+///
+/// DBC names are already `[A-Za-z0-9_]`, so the only thing that cannot be a
+/// Rust identifier is a leading digit. Prefix those rather than rename them,
+/// so the type still reads as the message it came from.
+fn message_ident(name: &str) -> Ident {
+    let valid = match name.chars().next() {
+        Some(c) if c.is_ascii_digit() => format!("_{name}"),
+        _ => name.to_string(),
+    };
+    Ident::new(&valid, proc_macro2::Span::call_site())
+}
+
 impl<'a> DeriveData<'a> {
+    /// Every message in the DBC, named as the DBC names it.
+    ///
+    /// The derive generates only what a struct field asks for. This is the
+    /// other end: the DBC is the list, so nothing repeats it in Rust.
+    fn all(dbc: DBC) -> Self {
+        let mut messages: BTreeMap<String, MessageInfo<'_>> =
+            Default::default();
+        for (index, message) in dbc.messages().iter().enumerate() {
+            let ident = message_ident(message.message_name());
+            let key = ident.to_string();
+            // A DBC with two messages of the same name would generate the
+            // type twice and fail to compile. Keep the first and say so.
+            if messages.contains_key(&key) {
+                eprintln!(
+                    "Warning: DBC has more than one message named {key}; \
+                     generating the first only"
+                );
+                continue;
+            }
+            if let Some(info) = MessageInfo::at_index(&dbc, index, ident, &[]) {
+                messages.insert(key, info);
+            }
+        }
+        // `messages` borrows nothing from `dbc`, so moving it in is fine.
+        Self {
+            name: None,
+            dbc,
+            messages,
+        }
+    }
+
     fn from(input: &'a DeriveInput) -> Result<Self> {
         // load the DBC file
         let dbc_file = parse_attr(&input.attrs, "dbc_file")
             .expect("No DBC file specified");
-        let contents = read(&dbc_file).expect("Could not read DBC");
-        let contents = normalize_dbc(&String::from_utf8_lossy(&contents));
-        let dbc = match DBC::from_slice(contents.as_bytes()) {
-            Ok(dbc) => dbc,
-            Err(can_dbc::Error::Incomplete(dbc, _)) => {
-                // TODO: emit an actual compiler warning
-                eprintln!(
-                    "Warning: DBC load incomplete; some data may be missing"
-                );
-                dbc
-            }
-            Err(_) => {
-                panic!("Unable to parse {dbc_file}");
-            }
-        };
+        let dbc = load_dbc(&dbc_file);
 
         // Collect VAL_TABLE_ names so we can accept them as fields
         let val_table_names: std::collections::HashSet<String> = dbc
@@ -669,7 +743,7 @@ impl<'a> DeriveData<'a> {
         }
 
         Ok(Self {
-            name: &input.ident,
+            name: Some(&input.ident),
             dbc,
             messages,
         })
@@ -727,7 +801,7 @@ impl<'a> DeriveData<'a> {
 
             let dlc = *m.message_size() as usize;
             let dlc8 = dlc as u8;
-            let ident = message.ident;
+            let ident = &message.ident;
 
             // build signal decoders and encoders
             let mut decoders = TokenStream::new();
@@ -738,7 +812,7 @@ impl<'a> DeriveData<'a> {
             }
             let cycle_time = if let Some(c) = message.cycle_time {
                 quote! {
-                    const CYCLE_TIME: usize = #c;
+                    pub const CYCLE_TIME: usize = #c;
                 }
             } else {
                 quote! {}
@@ -863,6 +937,34 @@ impl<'a> DeriveData<'a> {
             }
         }
     }
+}
+
+/// Generate a type for **every** message and value table in a DBC file.
+///
+/// ```ignore
+/// dbc_data::dbc_all!("dbcs/example_tool.dbc");
+/// ```
+///
+/// The counterpart to `#[derive(DbcData)]`. The derive generates only the
+/// messages a struct field names, which is what an embedded target wants.
+/// This generates all of them, for when the DBC already *is* the list and
+/// repeating it in Rust would be a second place to keep in step.
+///
+/// Each message becomes a `pub struct` named exactly as the DBC names it,
+/// with the same `ID`, `DLC`, `EXTENDED`, `encode` and `decode` the derive
+/// produces. Value tables become enums either way.
+///
+/// The path is resolved the same way `#[dbc_file = "..."]` resolves it:
+/// relative to the directory the compiler runs the crate from. Put the call
+/// in its own module if you want the types scoped.
+///
+/// Note: cargo does not know the DBC is an input, so editing only the `.dbc`
+/// does not trigger a rebuild. Touch a source file in the crate after a DBC
+/// edit.
+#[proc_macro]
+pub fn dbc_all(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let path = parse_macro_input!(input as syn::LitStr).value();
+    DeriveData::all(load_dbc(&path)).build().into()
 }
 
 #[proc_macro_derive(DbcData, attributes(dbc_file, dbc_signals))]

@@ -1,0 +1,32 @@
+VERSION "1"
+
+NS_ :
+	CM_
+	BA_DEF_
+	BA_DEF_DEF_
+	BA_
+	VAL_
+
+BS_:
+
+BU_: Ecu1 Ecu2
+
+VAL_TABLE_ PumpMode 0 "Off" 1 "Idle" 2 "Running" 3 "Fault" ;
+
+BO_ 512 PumpCommand: 8 Ecu1
+ SG_ enable : 0|1@1+ (1,0) [0|1] "" Ecu2
+ SG_ target_rpm : 8|16@1- (1,0) [-32767|32767] "RPM" Ecu2
+
+BO_ 513 PumpState: 4 Ecu2
+ SG_ mode : 0|4@1+ (1,0) [0|15] "MODE" Ecu1
+ SG_ rpm : 8|16@1- (1,0) [-32767|32767] "RPM" Ecu1
+
+BO_ 514 PumpTemperature: 2 Ecu2
+ SG_ celsius : 0|16@1- (0.1,0) [-3276.7|3276.7] "degC" Ecu1
+
+BO_ 2147549184 PumpDiagnostics: 8 Ecu2
+ SG_ fault_code : 0|16@1+ (1,0) [0|65535] "" Ecu1
+
+BA_DEF_ BO_ "GenMsgCycleTime" INT 0 10000;
+BA_DEF_DEF_ "GenMsgCycleTime" 0;
+BA_ "GenMsgCycleTime" BO_ 512 100;
