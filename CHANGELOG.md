@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+* Adds `dbc_all!("path.dbc")`, which generates a type for every message and value table in a DBC file. The derive generates only what a struct field names, which is what an embedded target wants; use this when the DBC already is the list and repeating it in Rust would be a second place to keep in step.
+* Fixes `CYCLE_TIME` being generated without `pub`, so it could not be read from outside the module that declared the message.
+
 ## 0.1.3
 * Allow partial parsing of DBC files to generate what code it can; the can_dbc crate does not support all token types (e.g. `BA_DEF_REL_` and `BA_DEF_DEF_REL_`) but if those are later in the file it's still possible to get at the messages and signals of interest
 * Add more tests of signed values for LE/BE aligned cases

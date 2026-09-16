@@ -62,6 +62,23 @@ can be brought into scope by referencing their name as a type
 (e.g. `SomeMessage` as shown above) and this determines what code
 is generated.  Messages not referenced will not generate any code.
 
+To generate *every* message and value table in a file instead, use
+the `dbc_all!` macro.  There is no struct to write:
+
+```rust
+mod flex {
+    dbc_data::dbc_all!("dbcs/amiga_flex.dbc");
+}
+```
+
+Each message becomes a `pub struct` named exactly as the DBC names
+it, with the same `ID`, `DLC`, `EXTENDED`, `encode` and `decode` the
+derive produces.  Use this when the DBC already is the list of
+messages you care about, and repeating that list in Rust would just
+be a second place to keep in step.  Use the derive when you want a
+minimal footprint, or when you need `#[dbc_signals]` to narrow a
+message to a few signals.
+
 When a range of message IDs contain the same signals, such as a
 series of readings which do not fit into a single message, then
 declaring an array will allow that type to be used for all of them.
