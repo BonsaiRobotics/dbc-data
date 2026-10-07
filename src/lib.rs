@@ -642,7 +642,7 @@ impl<'a> MessageInfo<'a> {
 
 /// Read and parse a DBC file, applying the normalizations this crate needs.
 fn load_dbc(dbc_file: &str) -> DBC {
-    let contents = read(dbc_file).expect("Could not read DBC");
+    let contents = read(resolve_dbc_path(dbc_file)).expect("Could not read DBC");
     let contents = normalize_dbc(&String::from_utf8_lossy(&contents));
     match DBC::from_slice(contents.as_bytes()) {
         Ok(dbc) => dbc,
@@ -654,6 +654,16 @@ fn load_dbc(dbc_file: &str) -> DBC {
         Err(_) => {
             panic!("Unable to parse {dbc_file}");
         }
+    }
+}
+
+/// A relative path is taken from the crate that uses the macro. Cargo runs
+/// workspace members from the workspace root, so the working directory is not it.
+fn resolve_dbc_path(dbc_file: &str) -> std::path::PathBuf {
+    let path = std::path::Path::new(dbc_file);
+    match std::env::var_os("CARGO_MANIFEST_DIR") {
+        Some(dir) if path.is_relative() => std::path::Path::new(&dir).join(path),
+        _ => path.to_path_buf(),
     }
 }
 
@@ -955,8 +965,8 @@ impl<'a> DeriveData<'a> {
 /// produces. Value tables become enums either way.
 ///
 /// The path is resolved the same way `#[dbc_file = "..."]` resolves it:
-/// relative to the directory the compiler runs the crate from. Put the call
-/// in its own module if you want the types scoped.
+/// relative to the manifest directory of the crate that uses the macro. Put
+/// the call in its own module if you want the types scoped.
 ///
 /// Note: cargo does not know the DBC is an input, so editing only the `.dbc`
 /// does not trigger a rebuild. Touch a source file in the crate after a DBC
