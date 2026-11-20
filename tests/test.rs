@@ -25,6 +25,11 @@ mod test {
     }
 
     #[test]
+    fn the_dbc_version_line_becomes_a_struct_constant() {
+        assert_eq!(Test::DBC_VERSION, "1");
+    }
+
+    #[test]
     fn basic() {
         let mut t = Test::default();
         assert!(!t.aligned_le.decode(&[0x00]));
