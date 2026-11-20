@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+* Adds `DBC_VERSION`, the DBC's `VERSION` string: an associated constant of the derived struct, or a module constant from `dbc_all!`.
+* Fixes a stale build after a DBC-only edit: the generated code now includes the DBC's bytes, so the compiler tracks the file and a change rebuilds the crate.
 * Adds `dbc_all!("path.dbc")`, which generates a type for every message and value table in a DBC file. The derive generates only what a struct field names, which is what an embedded target wants; use this when the DBC already is the list and repeating it in Rust would be a second place to keep in step.
 * Fixes `CYCLE_TIME` being generated without `pub`, so it could not be read from outside the module that declared the message.
 

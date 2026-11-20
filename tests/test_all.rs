@@ -99,3 +99,9 @@ fn decode_still_rejects_the_wrong_length() {
     assert!(!state.decode(&[0u8; 3]));
     assert!(!state.decode(&[0u8; 5]));
 }
+
+#[test]
+fn the_dbc_version_line_becomes_a_module_constant() {
+    assert_eq!(pump::DBC_VERSION, "3.0");
+    assert_eq!(every::DBC_VERSION, "1");
+}

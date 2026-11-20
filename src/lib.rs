@@ -86,6 +86,9 @@
 //! * Decode signals from PDU into native types
 //!     * const definitions for `ID: u32`, `DLC: u8`, `EXTENDED: bool`,
 //!       and `CYCLE_TIME: usize` when present
+//! * `DBC_VERSION: &str`, the `VERSION` line of the DBC: an associated
+//!   constant of the derived struct, or a module constant from `dbc_all!`
+//! * A DBC edit rebuilds the crate that uses it
 //! * Encode signals into PDU (all alignments and byte orders)
 //!
 //! # TODO
@@ -220,6 +223,8 @@ struct DeriveData<'a> {
     name: Option<&'a Ident>,
     /// The parsed DBC file
     dbc: can_dbc::DBC,
+    /// Where the DBC was read from, so the compiler can track it
+    path: std::path::PathBuf,
     /// All of the messages to derive
     messages: BTreeMap<String, MessageInfo<'a>>,
 }
@@ -685,7 +690,7 @@ impl<'a> DeriveData<'a> {
     ///
     /// The derive generates only what a struct field asks for. This is the
     /// other end: the DBC is the list, so nothing repeats it in Rust.
-    fn all(dbc: DBC) -> Self {
+    fn all(path: std::path::PathBuf, dbc: DBC) -> Self {
         let mut messages: BTreeMap<String, MessageInfo<'_>> =
             Default::default();
         for (index, message) in dbc.messages().iter().enumerate() {
@@ -708,6 +713,7 @@ impl<'a> DeriveData<'a> {
         Self {
             name: None,
             dbc,
+            path,
             messages,
         }
     }
@@ -717,6 +723,7 @@ impl<'a> DeriveData<'a> {
         let dbc_file = parse_attr(&input.attrs, "dbc_file")
             .expect("No DBC file specified");
         let dbc = load_dbc(&dbc_file);
+        let path = resolve_dbc_path(&dbc_file);
 
         // Collect VAL_TABLE_ names so we can accept them as fields
         let val_table_names: std::collections::HashSet<String> = dbc
@@ -755,6 +762,7 @@ impl<'a> DeriveData<'a> {
         Ok(Self {
             name: Some(&input.ident),
             dbc,
+            path,
             messages,
         })
     }
@@ -769,6 +777,28 @@ impl<'a> DeriveData<'a> {
 
     fn build(self) -> TokenStream {
         let mut out = TokenStream::new();
+
+        // Reading the DBC in the macro hides it from cargo. Including its
+        // bytes makes the compiler track it, so a DBC edit rebuilds.
+        let path = self.path.to_string_lossy();
+        out.append_all(quote! {
+            const _: &[u8] = include_bytes!(#path);
+        });
+
+        // The VERSION line of the DBC, as written.
+        let version = self.dbc.version().0.as_str();
+        out.append_all(match self.name {
+            Some(name) => quote! {
+                impl #name {
+                    #[allow(dead_code)]
+                    pub const DBC_VERSION: &'static str = #version;
+                }
+            },
+            None => quote! {
+                #[allow(dead_code)]
+                pub const DBC_VERSION: &str = #version;
+            },
+        });
 
         // Generate enums from VAL_TABLE_ definitions
         let mut generated_enums = std::collections::HashSet::new();
@@ -968,13 +998,14 @@ impl<'a> DeriveData<'a> {
 /// relative to the manifest directory of the crate that uses the macro. Put
 /// the call in its own module if you want the types scoped.
 ///
-/// Note: cargo does not know the DBC is an input, so editing only the `.dbc`
-/// does not trigger a rebuild. Touch a source file in the crate after a DBC
-/// edit.
+/// It also generates `DBC_VERSION`, the DBC's `VERSION` string, as a
+/// constant in the same module. An edit to the DBC rebuilds the crate.
 #[proc_macro]
 pub fn dbc_all(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let path = parse_macro_input!(input as syn::LitStr).value();
-    DeriveData::all(load_dbc(&path)).build().into()
+    DeriveData::all(resolve_dbc_path(&path), load_dbc(&path))
+        .build()
+        .into()
 }
 
 #[proc_macro_derive(DbcData, attributes(dbc_file, dbc_signals))]
